@@ -41,6 +41,20 @@ if pkill -f "backtalk[.]main" 2>/dev/null; then
   echo "[backtalk] replaced a previous voice session"
   sleep 1   # let the old process release mic/speaker devices
 fi
+# pkill above only sees this shell's own MSYS process tree, so a backtalk
+# instance launched from a *different* terminal (the normal case on
+# Windows — you never relaunch from the same window) survives it. Sweep
+# by command line system-wide instead, via a real .ps1 file rather than an
+# inline -Command string (that was tried first and failed: bash's argv
+# escaping through to a native exe is fragile enough that it silently
+# never fired). No-op where powershell.exe doesn't exist (real Linux/Mac).
+if command -v powershell.exe >/dev/null 2>&1; then
+  killed=$(powershell.exe -NoProfile -ExecutionPolicy Bypass -File "kill-stale.ps1" -Pattern "*backtalk.main*" 2>/dev/null | tr -d '\r')
+  if [ -n "$killed" ] && [ "$killed" != "0" ]; then
+    echo "[backtalk] replaced a previous voice session (cross-window)"
+    sleep 1
+  fi
+fi
 # Self-repair: reconcile the environment with the shipped package list
 # before launching (sub-second when already current). --inexact keeps
 # anything the person's agent added on purpose; a missing package

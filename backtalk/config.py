@@ -207,6 +207,26 @@ DEFAULTS = {
     # CLAUDE.md covers the character. Use this for a note that belongs to
     # neither, e.g. a rule that only applies when it is speaking.
     "discipline_append": "",
+    # Remote voice access: a phone (or anything else that speaks this
+    # WebSocket protocol) becomes another mouth/ears into THIS SAME live
+    # session — not a second assistant. OFF by default, same as every
+    # other opt-in feature here. See remote.py for the protocol.
+    "remote": {
+        "enabled": False,
+        # Bind address for the WSS listener. "0.0.0.0" reaches this
+        # machine from your LAN (or a VPN like Tailscale); "127.0.0.1"
+        # restricts it to this machine only.
+        "host": "0.0.0.0",
+        "port": 7777,
+        # OS credential-store item name for the auth token (same lookup
+        # chain as elevenlabs.key_slot — see secrets_store.get_secret).
+        # On Windows, where there's no store hook yet, the token comes
+        # from this env var instead: BACKTALK_REMOTE_TOKEN.
+        "token_key_slot": "backtalk-remote",
+        "max_connections": 2,
+        "rate_limit_per_minute": 10,
+        "idle_timeout_s": 300,
+    },
 }
 
 # The spoken-delivery discipline — the MEDIUM half of what used to be a

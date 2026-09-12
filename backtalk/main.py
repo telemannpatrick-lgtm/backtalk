@@ -625,11 +625,20 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         if batch:
             mouth.say_chunk(" ".join(batch), pending)
             pending = []
+        # A normal, non-interrupted turn never reset state after this
+        # point -- only the "zero sentences" edge case below did. So
+        # every ordinary successful reply left the raw state file stuck
+        # on "thinking" indefinitely once speech (which overrides state
+        # via fresh waveform data, not this file) finished. "speaking"
+        # during actual playback still shows correctly regardless of this
+        # -- ai-visualizer's read_bus() only falls back to this file once
+        # the waveform goes stale, so setting idle here doesn't cut
+        # speech short.
+        signals.set_state("idle")
         if first:
             # Zero sentences yielded (brain error / empty turn): nothing
             # will ever dequeue, so nothing resets the bus — park it here.
             signals.static_stop()
-            signals.set_state("idle")
     except asyncio.CancelledError:
         try:
             await brain.interrupt()
@@ -667,6 +676,20 @@ async def amain():
     brain = WarmBrain(model=model,
                       can_use_tool=make_permission_gate(mouth),
                       resume_id=resume_id)
+
+    # Remote voice access (opt-in, see remote.py): a connected client
+    # becomes another mouth/ears into THIS session. remote_q feeds the
+    # same handle() pipeline as typed input; broadcast_tap mirrors
+    # everything backtalk speaks to any connected client.
+    remote_q: "queue.Queue[str]" = queue.Queue()
+    remote_server = None
+    if CFG.get("remote", {}).get("enabled"):
+        from backtalk.remote import RemoteServer
+        remote_server = RemoteServer(remote_q, asyncio.get_event_loop())
+        if await remote_server.start():
+            mouth.taps.append(remote_server.broadcast_tap)
+        else:
+            remote_server = None
 
     mode = ("hands-free listening (the talk key still works)"
             if _MIC["mode"] == "open"
@@ -722,6 +745,7 @@ async def amain():
     typed_q: "queue.Queue[str]" = queue.Queue()
     threading.Thread(target=_typed_reader, args=(typed_q,), daemon=True).start()
     typed_fut: asyncio.Future | None = None
+    remote_fut: asyncio.Future | None = None
 
     async def run_console(verb):
         """One voice-console verb. The current reply was already
@@ -952,7 +976,8 @@ async def amain():
         # capture would turn one held utterance into two turns), and,
         # without barge-in, while the mouth speaks.
         mic_gate = (lambda: _MIC["btn"]
-                    or (not barge_in and mouth.speaking))
+                    or (not barge_in and (mouth.speaking
+                                          or signals.is_static_playing())))
         mic_fails = 0
         while True:
             if _MIC["gen"] != mic_gen_seen:
@@ -968,6 +993,10 @@ async def amain():
             if press_fut is None:
                 press_fut = loop.run_in_executor(None, ptt.wait_press)
             waiters = {press_fut, typed_fut}
+            if remote_server is not None:
+                if remote_fut is None:
+                    remote_fut = loop.run_in_executor(None, remote_q.get)
+                waiters.add(remote_fut)
             if _MIC["mode"] == "open":
                 if mic_fut is None:
                     g = _MIC["gen"]
@@ -980,6 +1009,11 @@ async def amain():
                 waiters, return_when=asyncio.FIRST_COMPLETED)
             if typed_fut in done:
                 text = typed_fut.result(); typed_fut = None
+                if text and not await handle(text):
+                    return
+                continue
+            if remote_fut is not None and remote_fut in done:
+                text = remote_fut.result(); remote_fut = None
                 if text and not await handle(text):
                     return
                 continue
@@ -1003,6 +1037,10 @@ async def amain():
                 mic_fut = None
                 if g != _MIC["gen"]:
                     continue             # captured before a switch
+                if text and NAME.lower() not in text.lower():
+                    log(f"[ears] ignored (no wake word): {text!r}")
+                    signals.set_state("idle")
+                    continue
                 if text and not await handle(text):
                     return
                 continue
@@ -1059,6 +1097,8 @@ async def amain():
         signals.static_stop()
         signals.set_state("idle")
         await brain.stop()
+        if remote_server is not None:
+            await remote_server.stop()
         log("[backtalk] hung up")
 
 

@@ -40,6 +40,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -63,6 +64,8 @@ _THINKING_SOUND = CFG.get("thinking_sound") or ""
 _WAVEFORM_MIN_INTERVAL = 1.0 / 15   # ~15 writes/sec is plenty for 60fps reads
 _last_waveform_write = 0.0
 _static_proc: subprocess.Popen | None = None
+_static_thread: threading.Thread | None = None
+_static_stop_event = threading.Event()
 
 
 def set_state(name: str):
@@ -174,9 +177,59 @@ def set_rate_limit(window: str, utilization, resets_at):
         pass
 
 
+def _quiet_copy(path: str, factor: float = 0.35) -> str:
+    """Windows-only: SoundPlayer has no volume control, so scale the WAV
+    samples down once and cache the result next to the original, rather
+    than re-scaling on every single play. Returns the original path
+    unchanged if anything about this goes wrong -- a full-volume thinking
+    sound beats a silent one."""
+    import wave
+    quiet_path = path.rsplit(".", 1)[0] + f"_quiet{int(factor*100)}.wav"
+    if os.path.exists(quiet_path):
+        return quiet_path
+    try:
+        with wave.open(path, "rb") as src:
+            params = src.getparams()
+            frames = src.readframes(src.getnframes())
+        if params.sampwidth != 2:
+            return path  # only handling the common 16-bit case
+        import array
+        samples = array.array("h", frames)
+        for i in range(len(samples)):
+            samples[i] = int(samples[i] * factor)
+        with wave.open(quiet_path, "wb") as dst:
+            dst.setparams(params)
+            dst.writeframes(samples.tobytes())
+        return quiet_path
+    except Exception:
+        return path
+
+
 def _player_cmd(path: str) -> list[str] | None:
     if sys.platform == "darwin":
         return ["afplay", "-v", "0.35", path]
+    if sys.platform == "win32":
+        # None of afplay/ffplay/aplay/paplay exist on Windows by default,
+        # so this branch was previously silently falling through to
+        # returning None -- the thinking sound never played through the
+        # local speakers at all, only via ai-visualizer's own separate
+        # browser-side player watching the same .voice_loading_pid signal.
+        # PowerShell's SoundPlayer needs no extra install, same fix
+        # pattern already used for jarvis-dashboard's Windows TTS bug.
+        # SoundPlayer has no volume control at all (always full system
+        # volume, unlike afplay's "-v 0.35" and ffplay's "-volume 35"
+        # above) -- tried Windows Media Player's COM object next since it
+        # does expose volume, but on this machine it got permanently
+        # stuck in the "Transitioning" playState and never actually
+        # played anything, likely because classic Windows Media Player
+        # itself isn't fully present on this debloated Windows build.
+        # Real fix: pre-generate a volume-reduced copy of the sound file
+        # once, and play THAT with the SoundPlayer approach that's
+        # already confirmed working -- sidesteps needing any player to
+        # support volume control at all.
+        quiet_path = _quiet_copy(path)
+        return ["powershell", "-NoProfile", "-Command",
+                f"(New-Object Media.SoundPlayer '{quiet_path}').PlaySync()"]
     for cand in ("ffplay", "aplay", "paplay"):
         from shutil import which
         if which(cand):
@@ -187,33 +240,62 @@ def _player_cmd(path: str) -> list[str] | None:
     return None
 
 
-def static_start():
-    """Optional thinking sound — plays while the brain works."""
+def _static_loop(cmd: list[str]):
+    """Runs on a background thread: replays the thinking sound back-to-back
+    until static_stop() sets the stop event. Fixes a real gap -- the sound
+    used to play exactly once (~20-36s) and then go silent for however
+    much longer the actual task took, which is most of them tonight."""
     global _static_proc
+    while not _static_stop_event.is_set():
+        try:
+            _static_proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            with open(_LOADING_PID_FILE, "w") as f:
+                f.write(str(_static_proc.pid))
+        except OSError:
+            return
+        _static_proc.wait()
+        if _static_stop_event.is_set():  # terminated by static_stop()
+            return
+
+
+def static_start():
+    """Optional thinking sound — loops while the brain works."""
+    global _static_thread
     if not _THINKING_SOUND or not os.path.exists(_THINKING_SOUND):
         return
     static_stop()
     cmd = _player_cmd(_THINKING_SOUND)
     if not cmd:
         return
-    try:
-        _static_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        with open(_LOADING_PID_FILE, "w") as f:
-            f.write(str(_static_proc.pid))
-    except OSError:
-        _static_proc = None
+    _static_stop_event.clear()
+    _static_thread = threading.Thread(
+        target=_static_loop, args=(cmd,), daemon=True)
+    _static_thread.start()
 
 
 def static_stop():
-    global _static_proc
+    global _static_proc, _static_thread
+    _static_stop_event.set()
     if _static_proc is not None:
         try:
             _static_proc.terminate()
         except OSError:
             pass
         _static_proc = None
+    if _static_thread is not None:
+        _static_thread.join(timeout=1.0)
+        _static_thread = None
     try:
         os.remove(_LOADING_PID_FILE)
     except OSError:
         pass
+
+
+def is_static_playing() -> bool:
+    """True while the thinking sound is actively looping. The open mic's
+    gate needs this -- it only ever checked mouth.speaking, so once the
+    thinking sound started looping continuously (instead of playing once
+    for ~20-36s) it bled into the real mic for however long a task took,
+    repeatedly triggering false VAD detections on its own audio."""
+    return _static_thread is not None and _static_thread.is_alive()

@@ -332,6 +332,35 @@ def synth_stream(text: str, timeout: float = 30.0):
         yield KOKORO_RATE, pcm
 
 
+def _out_device():
+    """Prefer the WASAPI entry for the OS's actual default output device.
+
+    Windows lists a single physical output once per audio backend, the
+    same way it does for input (see ears._mic_index). Leaving `device`
+    unset trusts PortAudio's own idea of "default output", which can
+    resolve to a legacy backend (MME) that opens and accepts writes
+    without ever raising, yet produces no audible sound on some setups
+    -- indistinguishable from success at this layer. That is exactly the
+    class of bug already found and fixed on the mic side; this mirrors
+    that fix for playback. Returns None (PortAudio's own default,
+    the prior behavior) if no WASAPI match is found.
+    """
+    try:
+        devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
+        default_idx = sd.default.device[1]
+        if default_idx is None or default_idx < 0:
+            return None
+        want_name = devices[default_idx]["name"]
+        for i, d in enumerate(devices):
+            if d.get("max_output_channels", 0) > 0 and d["name"] == want_name \
+                    and hostapis[d["hostapi"]]["name"] == "Windows WASAPI":
+                return i
+    except Exception:
+        pass
+    return None
+
+
 class Mouth:
     def __init__(self):
         from backtalk.ducking import Ducker
@@ -343,6 +372,12 @@ class Mouth:
         self._out: sd.OutputStream | None = None
         self._out_rate: int | None = None
         self.ducker = Ducker()  # public: PTT ducks for the USER's voice too
+        # Optional callables: fn(sentence: str, directions) -> None, fired
+        # from the worker thread right before each sentence is spoken
+        # locally. remote.py registers one here to mirror every reply
+        # (and permission question) to any connected remote client.
+        # Empty by default -- zero behavior change with no taps.
+        self.taps: list = []
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -398,6 +433,11 @@ class Mouth:
             sentence, directions = item if isinstance(item, tuple) else (item, None)
             if not sentence:
                 continue
+            for tap in self.taps:
+                try:
+                    tap(sentence, directions)
+                except Exception as e:
+                    log(f"[mouth] tap error: {e}")
             self._stop.clear()
             self._speaking.set()
             self.ducker.speech_start()
@@ -435,7 +475,27 @@ class Mouth:
             except Exception:
                 log("[mouth] the output stream went away, reopening")
         self._drop_out()
-        self._out = sd.OutputStream(samplerate=rate, channels=1, dtype="int16")
+        dev = _out_device()
+        try:
+            # auto_convert lets WASAPI's own (well-tested) resampler
+            # handle the rate mismatch -- a hand-rolled resample to the
+            # device's reported native rate measured badly wrong here
+            # (pitched down, "horror movie" per a real listening test),
+            # most likely because that reported default_samplerate isn't
+            # reliably what the shared-mode engine is actually running.
+            # Trust WASAPI's own conversion instead of guessing at it.
+            extra = sd.WasapiSettings(auto_convert=True) if dev is not None else None
+            self._out = sd.OutputStream(device=dev, samplerate=rate,
+                                        channels=1, dtype="int16",
+                                        extra_settings=extra)
+        except Exception as e:
+            if dev is not None:
+                log(f"[mouth] WASAPI output open failed ({e}) -- "
+                    f"falling back to the PortAudio default")
+                self._out = sd.OutputStream(samplerate=rate, channels=1,
+                                            dtype="int16")
+            else:
+                raise
         self._out_rate = rate
         self._out.start()
         return self._out

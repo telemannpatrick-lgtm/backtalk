@@ -34,6 +34,7 @@ import numpy as np
 import sounddevice as sd
 import webrtcvad
 
+from backtalk import signals
 from backtalk.config import CFG
 from backtalk.vlog import log
 
@@ -102,12 +103,23 @@ def _mic_index():
         return None
     try:
         devices = sd.query_devices()
+        hostapis = sd.query_hostapis()
     except Exception as e:
         log(f"[ears] could not list audio devices ({e}) -- using the "
             f"default mic")
         return None
     ins = [(i, d) for i, d in enumerate(devices)
            if d.get("max_input_channels", 0) > 0]
+    # Windows lists the same physical mic once per audio backend (MME,
+    # DirectSound, WASAPI, WDM-KS). WASAPI is the modern, correct one;
+    # measured on a real device, MME's own format conversion produced
+    # near-silent captures (0.1-0.6% peak) while WASAPI captured the
+    # same voice cleanly (11%+ peak) seconds apart with nothing else
+    # changed. When several entries share a name, try the WASAPI one
+    # first.
+    def _is_wasapi(idx: int) -> bool:
+        return hostapis[devices[idx]["hostapi"]]["name"] == "Windows WASAPI"
+    ins = sorted(ins, key=lambda pair: not _is_wasapi(pair[0]))
     for i, d in ins:
         if d["name"] == want:
             _mic_device_warned = False
@@ -124,6 +136,42 @@ def _mic_index():
     return None
 
 
+class _ResamplingStream:
+    """Wraps a stream opened at the device's OWN rate and presents reads
+    in RATE (16kHz) frames via a plain decimate-average downsample.
+
+    Some backends -- Windows WASAPI in particular -- refuse to open at
+    16kHz outright rather than resampling for us (PaErrorCode -9997,
+    "Invalid sample rate"). PortAudio does offer an auto-convert path
+    for WASAPI, but it measured unreliable on a real device: the exact
+    same recording that peaked at 11%+ captured natively came back at
+    0.4% through auto-convert. Decimate-average from the true native
+    rate measured lossless by comparison (peak survived a 48kHz -> 16kHz
+    pass byte-for-byte), so that is what this does instead of trusting
+    the OS to do it.
+    """
+
+    def __init__(self, device, native_rate: int):
+        self._factor = max(1, round(native_rate / RATE))
+        self._native_frame_len = FRAME_LEN * self._factor
+        self._stream = sd.InputStream(device=device, samplerate=native_rate,
+                                      channels=1, dtype="int16",
+                                      blocksize=self._native_frame_len)
+
+    def __enter__(self):
+        self._stream.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        return self._stream.__exit__(*exc)
+
+    def read(self, frames):
+        block, overflow = self._stream.read(frames * self._factor)
+        arr = block[:, 0].astype(np.float64)
+        down = arr.reshape(frames, self._factor).mean(axis=1).astype(np.int16)
+        return down.reshape(-1, 1), overflow
+
+
 def _open_mic():
     """Open the capture stream on the configured mic.
 
@@ -138,6 +186,14 @@ def _open_mic():
         return sd.InputStream(device=dev, **opts)
     except Exception as e:
         if dev is not None:
+            try:
+                native_rate = int(sd.query_devices(dev)["default_samplerate"])
+                if native_rate != RATE:
+                    log(f"[ears] mic_device wants {native_rate}Hz, not "
+                        f"{RATE}Hz -- capturing native and downsampling")
+                    return _ResamplingStream(dev, native_rate)
+            except Exception:
+                pass
             log(f"[ears] could not open mic_device {CFG.get('mic_device')!r} "
                 f"({e}) -- using the system default")
             try:
@@ -245,11 +301,24 @@ def check_microphone() -> bool:
     if _mic_checked:
         return True
     _mic_checked = True
+    dev = _mic_index()
     try:
-        sd.check_input_settings(device=_mic_index(), channels=1,
+        sd.check_input_settings(device=dev, channels=1,
                                 samplerate=RATE, dtype="int16")
         return True
     except Exception as e:
+        # Same fallback _open_mic() actually uses: some backends (WASAPI
+        # in particular) refuse a non-native rate outright. Check at the
+        # device's own rate before declaring it dead -- otherwise this
+        # cries wolf on a mic that works fine (see _ResamplingStream).
+        if dev is not None:
+            try:
+                native_rate = int(sd.query_devices(dev)["default_samplerate"])
+                sd.check_input_settings(device=dev, channels=1,
+                                        samplerate=native_rate, dtype="int16")
+                return True
+            except Exception:
+                pass
         global _mic_warned
         _mic_warned = True      # said it here; do not repeat on first press
         for line in _mic_message(str(e)):
@@ -323,6 +392,19 @@ def warm():
     return _model
 
 
+def _log_voice_id(pcm: np.ndarray) -> None:
+    """Phase 1 of voice-ID (see Second Brain Build Plan): identify-and-log
+    only, nothing gates on this yet. Never allowed to break the actual
+    voice pipeline -- any failure here is swallowed and logged, not raised.
+    """
+    try:
+        from backtalk import voiceid
+        name, sim = voiceid.identify(pcm, RATE)
+        log(f"[voiceid] {name} (similarity {sim:.3f})")
+    except Exception as e:
+        log(f"[voiceid] identification failed (non-fatal): {e!r}")
+
+
 def transcribe(pcm: np.ndarray) -> str:
     """int16 mono 16kHz -> text. Bracketed non-speech markers that
     whisper emits ([BLANK_AUDIO], [SIGHS], (coughs)...) are stripped;
@@ -342,7 +424,7 @@ def transcribe(pcm: np.ndarray) -> str:
 
 
 class Ears:
-    def __init__(self, aggressiveness: int = 2, silence_ms: int = 480):
+    def __init__(self, aggressiveness: int = 3, silence_ms: int = 1500):
         self.vad = webrtcvad.Vad(aggressiveness)
         self.silence_frames = silence_ms // FRAME_MS
 
@@ -384,6 +466,7 @@ class Ears:
                         in_utterance = True
                         frames = ring[:]
                         silence_run = 0
+                        signals.set_state("listening")
                 else:
                     frames.append(mono)
                     if is_speech:
@@ -400,7 +483,9 @@ class Ears:
                             frames, ring = [], []
                             speech_run = speech_total = 0
                             continue
-                        return transcribe(np.concatenate(frames))
+                        pcm = np.concatenate(frames)
+                        _log_voice_id(pcm)
+                        return transcribe(pcm)
 
 
 def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None:
@@ -418,7 +503,9 @@ def record_held(is_held, max_s: float = 60.0, min_s: float = 0.25) -> str | None
             frames.append(block[:, 0].copy())
     if len(frames) * FRAME_MS / 1000 < min_s:
         return None
-    return transcribe(np.concatenate(frames))
+    pcm = np.concatenate(frames)
+    _log_voice_id(pcm)
+    return transcribe(pcm)
 
 
 if __name__ == "__main__":

@@ -22,3 +22,22 @@ show.json
 .python-version
 # Config backups the setup wizard leaves behind.
 *.json.*.bak
+
+# Remote access TLS certs (remote.py): a private CA key and server key
+# live here, generated per-machine on first use. Never tracked.
+certs/
+
+# Voice-ID enrollment data (voiceid.py): real biometric embeddings and the
+# raw recordings used to build them. Personal to whoever enrolled -- never
+# tracked, on this machine or anyone else's fork.
+backtalk/voiceprints/
+raw24k.wav
+up48k.wav
+
+# Derived cache: the volume-reduced copy signals.py builds on first use
+# (see _quiet_copy) is regenerated automatically, not source.
+assets/*_quiet*.wav
+
+# The active voice-console session id -- resume-across-restarts state,
+# not source.
+.backtalk_session
