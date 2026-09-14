@@ -51,6 +51,16 @@ _SENTENCE_END = re.compile(r"(?<=[.!?])\s")
 SESSION_FILE = os.path.join(CFG["signals_dir"], ".backtalk_session")
 
 
+class BrainStalledError(Exception):
+    """Raised by ask_stream when the brain goes completely silent for
+    CFG['brain_stall_timeout'] seconds -- no text, no tool activity,
+    nothing. Distinct from a slow-but-alive turn (see ask_stream) and
+    from asyncio.CancelledError (the person interrupting on purpose):
+    this means the turn itself is presumed dead, so the caller can
+    recover instead of leaving the mic looping the thinking sound
+    forever with nobody the wiser."""
+
+
 class WarmBrain:
     def __init__(self, model: str | None = None, can_use_tool=None,
                  resume_id: str | None = None):
@@ -309,11 +319,26 @@ class WarmBrain:
             self._client = None
 
     async def ask_stream(self, utterance: str):
-        """Yield complete sentences as they stream out of the model."""
+        """Yield complete sentences as they stream out of the model.
+
+        Guarded by brain_stall_timeout: the timer resets on EVERY
+        message (tool activity counts, not just text), so one long
+        tool call inside an otherwise-healthy turn is never mistaken
+        for a stall -- only total silence for the whole window is."""
         self._dirty = True             # in flight until its ResultMessage
         await self._client.query(utterance)
         buf = ""
-        async for msg in self._client.receive_response():
+        stall_timeout = CFG.get("brain_stall_timeout") or 150
+        stream = self._client.receive_response().__aiter__()
+        while True:
+            try:
+                msg = await asyncio.wait_for(stream.__anext__(), stall_timeout)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                log(f"[brain] silent for {stall_timeout:.0f}s -- "
+                    f"treating the turn as dead")
+                raise BrainStalledError(utterance)
             t = type(msg).__name__
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}

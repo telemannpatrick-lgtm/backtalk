@@ -42,6 +42,13 @@ RATE = 16000
 FRAME_MS = 30
 FRAME_LEN = RATE * FRAME_MS // 1000  # samples per frame
 OPEN_FRAMES = 4        # ~120ms speech to open an utterance
+# Pre-roll ring, kept so the syllables spoken BEFORE the VAD opens survive.
+# OPEN_FRAMES of this is the speech that did the opening, so the true
+# lead-in is (PREROLL_FRAMES - OPEN_FRAMES) -- ~360ms here. At 8 frames it
+# was 120ms, which reliably ate the wake word: "Jarvis" takes ~400ms and
+# opens on a soft affricate the aggressiveness-3 VAD sleeps through, so
+# transcripts arrived as "Can you hear me?" with the name already gone.
+PREROLL_FRAMES = 16
 MAX_UTTER_S = 30
 
 _NONSPEECH = re.compile(r"[\[(][^\])]*[\])]")
@@ -459,7 +466,7 @@ class Ears:
                 is_speech = self.vad.is_speech(mono.tobytes(), RATE)
                 if not in_utterance:
                     ring.append(mono)
-                    if len(ring) > 8:
+                    if len(ring) > PREROLL_FRAMES:
                         ring.pop(0)
                     speech_run = speech_run + 1 if is_speech else 0
                     if speech_run >= OPEN_FRAMES:

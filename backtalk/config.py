@@ -196,6 +196,17 @@ DEFAULTS = {
     # a dead line. The bundled one ships in assets/; a relative path
     # resolves against this repo. Set "" to think in silence.
     "thinking_sound": "assets/thinking.wav",
+    # Safety net for a turn that goes completely silent: if the brain
+    # produces literally zero messages (no partial text, no tool
+    # activity) for this many seconds, the turn is presumed dead rather
+    # than merely slow, and backtalk recovers on its own instead of
+    # leaving the mic looping the thinking sound forever with the
+    # person having to notice and re-interrupt it themselves. Generous
+    # on purpose: a single long tool call (a slow bash command, a big
+    # file read) can legitimately produce no stream events for a
+    # while. Lower it if your agent's tool calls are always quick and
+    # you'd rather recover faster.
+    "brain_stall_timeout": 150,
     # Spoken lines. {name} is replaced with "name" above.
     "greeting": "Voice line online. Hold {ptt_key} and talk to me.",
     # Spoken instead of "greeting" when mic_mode is "open", where telling

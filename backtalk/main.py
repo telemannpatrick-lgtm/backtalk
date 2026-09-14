@@ -53,6 +53,8 @@ Flags:
 Say "goodbye <name>" / "end voice mode" to hang up. Ctrl-C works.
 """
 import asyncio
+import difflib
+import jellyfish
 import json
 import queue
 import re
@@ -62,7 +64,7 @@ import threading
 import time
 
 from backtalk import signals
-from backtalk.brain import WarmBrain
+from backtalk.brain import BrainStalledError, WarmBrain
 from backtalk.config import CFG
 from backtalk.ears import (Ears, explain_audio_failure, record_held,
                            warm as warm_ears)
@@ -72,6 +74,39 @@ from backtalk.vlog import log
 
 NAME = CFG["name"]
 QUIT_PHRASES = CFG["quit_phrases"]
+
+
+def _heard_wake_word(text: str) -> bool:
+    """True if NAME appears literally, or a word in text both sounds and
+    looks like it (STT mishearings like "Jarvis" -> "Travis" were
+    confirmed live, silently dropping the whole utterance).
+
+    Both signals are required because neither is sufficient alone.
+    Character similarity fires on words that merely share letters:
+    "risk", "artist", "various" and "harvest" all cleared a 0.6 ratio
+    against "jarvis". Phonetics alone cannot separate a real mishearing
+    from a coincidence: "travis" and "drives" produce the identical
+    metaphone code. Together they admit every mishearing tested while
+    leaving only "carves", "gravis" and "jars" -- rare enough in speech
+    to accept. 0.65 is deliberate: 0.70 starts rejecting "travis".
+
+    Thresholds are tuned for a name of this length. A much shorter one
+    ("Hal", "Sam") makes the metaphone code short enough that a single
+    edit matches common words, and would need retuning.
+
+    This matcher is the only guard against the mic waking the agent on
+    its own playback -- see the revert note in the listen loop below.
+    """
+    low = text.lower()
+    name = NAME.lower()
+    if name in low:
+        return True
+    name_code = jellyfish.metaphone(name)
+    return any(
+        jellyfish.levenshtein_distance(jellyfish.metaphone(w), name_code) <= 1
+        and difflib.SequenceMatcher(None, w, name).ratio() >= 0.65
+        for w in re.findall(r"[a-z']+", low)
+    )
 
 # ---- THE SPOKEN PERMISSION GATE (permission_mode "ask", the default).
 # When the agent wants a gated tool, the SDK routes the decision here:
@@ -645,6 +680,19 @@ async def speak_reply(brain: WarmBrain, mouth: Mouth, text: str):
         except Exception:
             pass
         raise
+    except BrainStalledError:
+        # The turn went completely silent -- distinct from the person
+        # interrupting on purpose (CancelledError, above). Recover the
+        # SAME WAY a fresh utterance would (reset_turn: interrupt, drain,
+        # rebuild the session if the drain itself can't land), except
+        # proactively, rather than making the person notice the hang,
+        # speak again, and wait out that recovery themselves.
+        signals.static_stop()
+        try:
+            await brain.reset_turn()
+        except Exception:
+            pass
+        mouth.say("Sorry, boss — that one died on me. Ask again?")
 
 
 async def amain():
@@ -1037,7 +1085,21 @@ async def amain():
                 mic_fut = None
                 if g != _MIC["gen"]:
                     continue             # captured before a switch
-                if text and NAME.lower() not in text.lower():
+                if text and not _heard_wake_word(text):
+                    # REVERTED (see git history / today's notes): a grace
+                    # window here to let a wake-word-free reply through
+                    # right after your agent asks a question turned out
+                    # to also accept its OWN trailing audio bouncing off
+                    # open speakers as if it were you -- confirmed live
+                    # as a real feedback loop (Jarvis answering itself,
+                    # repeatedly, verbatim) once barge-in kept the mic
+                    # hot through playback. The wake word is the only
+                    # thing standing between "you answered without the
+                    # wake word" and "the mic heard itself," and those
+                    # two cases are indistinguishable without it. Do not
+                    # reintroduce this without a real self-echo check
+                    # (e.g. comparing captured text against what was
+                    # just spoken) backing it.
                     log(f"[ears] ignored (no wake word): {text!r}")
                     signals.set_state("idle")
                     continue
