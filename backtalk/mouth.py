@@ -46,6 +46,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -419,7 +420,6 @@ class Mouth:
 
     def wait_done(self, timeout: float | None = None):
         """Block until the queue is drained and playback finished."""
-        import time
         deadline = None if timeout is None else time.time() + timeout
         while (not self._q.empty()) or self._speaking.is_set():
             time.sleep(0.05)
