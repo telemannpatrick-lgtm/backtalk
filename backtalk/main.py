@@ -777,7 +777,15 @@ async def amain():
                   "or the plan is out of usage.")
         mouth.wait_done(timeout=30)
         raise SystemExit(1)
-    log("[backtalk] brain warm")
+    if brain.last_error:
+        # Connected, but the CLI refused the warmup (usage limit, billing,
+        # outage). Stay up and say so: every later ask speaks the refusal
+        # too, and the line works again the moment the limit resets.
+        log("[backtalk] brain connected but REFUSING work")
+        mouth.say("My brain's connected, but it's refusing work right "
+                  f"now. {brain.last_error[1]}")
+    else:
+        log("[backtalk] brain warm")
     # the hidden warmup ping is plumbing, not conversation
     brain.session.update(turns=0, out_tokens=0, in_tokens=0, cost=0.0)
     # a configured effort level applies at launch (saved by the spoken

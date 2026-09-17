@@ -85,6 +85,8 @@ class WarmBrain:
         # True while a query's response hasn't been consumed through its
         # ResultMessage — i.e. the shared message pipe may hold leftovers.
         self._dirty = False
+        # (kind, text) of the CLI's refusal on the last ask, else None.
+        self.last_error: tuple[str, str] | None = None
 
     async def start(self):
         mode = CFG["permission_mode"]
@@ -162,6 +164,34 @@ class WarmBrain:
         except OSError:
             pass
 
+    def _error_of(self, msg):
+        """The CLI's refusal carried by msg, as (kind, text), else None.
+
+        A refused turn (usage limit hit, billing, auth, API outage) is
+        answered by the CLI itself with ONE complete AssistantMessage
+        whose `error` is set, never with stream deltas, so the text
+        path in ask_stream cannot see it. Unhandled, the turn ends with
+        zero sentences: no speech, no log line, a warmup that "passes".
+        That is exactly what 16 September was: a plan session limit
+        read as a crash, through four restarts."""
+        t = type(msg).__name__
+        if t == "AssistantMessage" and getattr(msg, "error", None):
+            text = " ".join(getattr(b, "text", "") or ""
+                            for b in getattr(msg, "content", []) or [])
+            return str(msg.error), text
+        if t == "ResultMessage" and getattr(msg, "is_error", False):
+            return (str(getattr(msg, "subtype", None) or "error"),
+                    str(getattr(msg, "result", None) or ""))
+        return None
+
+    def _note_error(self, err):
+        kind, text = err
+        text = " ".join(text.replace(" ·", ",").split()) \
+            or f"the request failed ({kind})"
+        log(f"[brain] ERROR ({kind}): {text}")
+        self.last_error = (kind, text)
+        return text
+
     def _tally(self, rm, count_turn=True):
         """Session usage bookkeeping. Must never break a turn."""
         try:
@@ -236,12 +266,20 @@ class WarmBrain:
         here would deafen the whole voice loop. On timeout the pipe is
         left marked dirty so the next reset_turn drains or rebuilds."""
         self._dirty = True
+        self.last_error = None
         await self._client.query(cmd)
         texts = []
 
         async def _collect():
             async for msg in self._client.receive_response():
                 t = type(msg).__name__
+                err = self._error_of(msg)
+                if err and self.last_error is None:
+                    # prefixed so the console speaks it instead of
+                    # confirming a command that never ran
+                    texts.append("error: " + self._note_error(err))
+                if err and t == "AssistantMessage":
+                    continue
                 if t == "AssistantMessage":
                     for b in getattr(msg, "content", []) or []:
                         txt = getattr(b, "text", None)
@@ -326,6 +364,7 @@ class WarmBrain:
         tool call inside an otherwise-healthy turn is never mistaken
         for a stall -- only total silence for the whole window is."""
         self._dirty = True             # in flight until its ResultMessage
+        self.last_error = None
         await self._client.query(utterance)
         buf = ""
         stall_timeout = CFG.get("brain_stall_timeout") or 150
@@ -340,6 +379,11 @@ class WarmBrain:
                     f"treating the turn as dead")
                 raise BrainStalledError(utterance)
             t = type(msg).__name__
+            err = self._error_of(msg)
+            if err and self.last_error is None:
+                # say the refusal out loud, once (the ResultMessage
+                # that follows usually repeats it)
+                yield self._note_error(err)
             if t == "StreamEvent":
                 ev = getattr(msg, "event", {}) or {}
                 if ev.get("type") == "content_block_delta":
