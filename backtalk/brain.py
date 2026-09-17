@@ -164,6 +164,23 @@ class WarmBrain:
         except OSError:
             pass
 
+    @staticmethod
+    def _answers_us(msg) -> bool:
+        """True for the ResultMessage that ends a turn backtalk sent.
+
+        The session also runs turns nobody here asked for: when a
+        backgrounded subagent finishes, the CLI injects a
+        task-notification turn with its own ResultMessage. Stopping at
+        THAT result hands its reply to whatever question is in flight
+        and leaves the real answer buffered for the next one: every
+        answer one turn late for the rest of the session (confirmed 16
+        September, 20:17). origin tells them apart: None (or "human")
+        is ours; any other kind was injected."""
+        if type(msg).__name__ != "ResultMessage":
+            return False
+        origin = getattr(msg, "origin", None)
+        return not origin or origin.get("kind") == "human"
+
     def _error_of(self, msg):
         """The CLI's refusal carried by msg, as (kind, text), else None.
 
@@ -271,7 +288,7 @@ class WarmBrain:
         texts = []
 
         async def _collect():
-            async for msg in self._client.receive_response():
+            async for msg in self._client.receive_messages():
                 t = type(msg).__name__
                 err = self._error_of(msg)
                 if err and self.last_error is None:
@@ -285,6 +302,12 @@ class WarmBrain:
                         txt = getattr(b, "text", None)
                         if txt:
                             texts.append(txt)
+                elif t == "ResultMessage" and not self._answers_us(msg):
+                    # an injected turn's reply is not this command's answer
+                    log(f"[brain] injected turn during {cmd!r}, not spoken: "
+                        f"{' '.join(texts)[:120]!r}")
+                    texts.clear()
+                    self._tally(msg, count_turn=False)
                 elif t == "ResultMessage":
                     self._dirty = False
                     self._tally(msg, count_turn=False)
@@ -306,7 +329,7 @@ class WarmBrain:
         """Re-align the message pipe after an interrupted/failed turn.
 
         THE OFF-BY-ONE BUG, and why this method exists: the SDK client
-        has ONE shared message stream and receive_response() stops at
+        has ONE shared message stream and a reader that stops at
         the FIRST ResultMessage it sees — there is no pairing between a
         query and its response. A cancelled turn stops consuming
         mid-stream, leaving the dead turn's remaining messages
@@ -326,9 +349,9 @@ class WarmBrain:
 
         async def _drain() -> int:
             n = 0
-            async for msg in self._client.receive_response():
+            async for msg in self._client.receive_messages():
                 n += 1
-                if type(msg).__name__ == "ResultMessage":
+                if self._answers_us(msg):
                     break
             return n
 
@@ -368,7 +391,7 @@ class WarmBrain:
         await self._client.query(utterance)
         buf = ""
         stall_timeout = CFG.get("brain_stall_timeout") or 150
-        stream = self._client.receive_response().__aiter__()
+        stream = self._client.receive_messages().__aiter__()
         while True:
             try:
                 msg = await asyncio.wait_for(stream.__anext__(), stall_timeout)
@@ -410,6 +433,18 @@ class WarmBrain:
                     buf = ""
                     if tail:
                         yield tail
+            elif t == "ResultMessage" and not self._answers_us(msg):
+                # An injected turn (a background task reporting back)
+                # ended, not ours: speak what it said as its own chunk
+                # and keep reading for the real answer.
+                kind = (getattr(msg, "origin", None) or {}).get("kind")
+                log(f"[brain] injected {kind} turn spoken, still waiting "
+                    f"for the answer")
+                self._tally(msg, count_turn=False)
+                tail = buf.strip()
+                buf = ""
+                if tail:
+                    yield tail
             elif t == "ResultMessage":
                 self._dirty = False    # turn fully consumed — pipe aligned
                 self._tally(msg)
