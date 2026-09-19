@@ -1,0 +1,8 @@
+# no-mistakes gate config for backtalk.
+# No automated test suite or lint config exists in this repo yet, so "clean"
+# is defined as compile-only: every module under backtalk/ must byte-compile
+# cleanly (catches syntax errors and bad imports) via `uv run` so it resolves
+# the repo's actual pinned dependencies. Tighten this (pytest, ruff) once a
+# real test/lint setup exists.
+commands:
+  test: "uv run python -m compileall -q backtalk"
